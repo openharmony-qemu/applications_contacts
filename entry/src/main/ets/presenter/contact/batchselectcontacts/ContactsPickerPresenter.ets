@@ -31,7 +31,8 @@ import {
 import { CustomizedParams, SingleSelectContact } from '../../../model/type';
 import { ContactsGlobalThisHelper } from '../../../../../../../common/src/main/ets/util/ContactsGlobalThisHelper';
 import ability from '@ohos.ability.ability';
-import WorkerWrapper from '../../../workers/base/WorkerWrapper';
+import WorkerWrapper, { WorkerRequestScope } from '../../../workers/base/WorkerWrapper';
+import type PickerSession from '../../../uiExtentionAbility/PickerSession';
 import Want from '@ohos.app.ability.Want';
 import emitter from '@ohos.events.emitter';
 import PhoneAccountType from '../../../../../../../feature/account/src/main/ets/type/PhoneAccountType';
@@ -92,8 +93,7 @@ export default class ContactsPickerPresenter {
   public hasChecked: boolean = false;
   public URI: string = '';
   // 外部需传入的参数
-  public uiExtentionParam = ContactsGlobalThisHelper.GetGlobalThis()
-    .getValue<UiExtentionParam>(ContactsGlobalThisHelper.UiExtentionAbilityParams);
+  public uiExtentionParam: UiExtentionParam | undefined = undefined;
   public isContactsPicker: boolean = false;
   public isMultiSelect: boolean = true;
   public isDisplayByName: boolean = false;
@@ -143,11 +143,92 @@ export default class ContactsPickerPresenter {
   private isOnePageShow = true;
   private onePageDataLength = 200;
 
+  private static sequence: number = 0;
+  public readonly selectionChangedEvent: string = 'ContactPickerSelection.' + (++ContactsPickerPresenter.sequence);
+  public resultPending: boolean = false;
+  private disposed: boolean = false;
+  private generation: number = 0;
+  private searchGeneration: number = 0;
+  private resultGeneration: number = 0;
+  private request?: PickerSession;
+  private queryScope: WorkerRequestScope = new WorkerRequestScope();
+  private resultScope?: WorkerRequestScope;
+  private tasks: Set<taskpool.Task> = new Set();
+
+  public static createForSession(request: PickerSession): ContactsPickerPresenter {
+    const presenter = new ContactsPickerPresenter();
+    presenter.request = request;
+    presenter.uiExtentionParam = request.params;
+    // Existing save/edit UI still resolves its presenter through this accessor.
+    // Public selection sessions never replace that legacy navigation instance.
+    if (request.params.isSaveContact || request.params.isSaveExistContact) {
+      ContactsPickerPresenter.sInstance = presenter;
+    }
+    request.addCleanup(() => presenter.dispose());
+    return presenter;
+  }
+
+  public isActive(): boolean {
+    return !this.disposed && (this.request === undefined || this.request.active);
+  }
+
+  private getContext(): common.UIAbilityContext | common.UIExtensionContext {
+    return this.request?.context ?? ContactsGlobalThisHelper.GetGlobalThis().getDefaultUIContext();
+  }
+
+  private getWorker(): WorkerWrapper {
+    return this.request?.worker ?? ContactsGlobalThisHelper.GetGlobalThis()
+      .getValue<WorkerWrapper>(ContactsGlobalThisHelper.DataWorkerName);
+  }
+
+  private setBusy(value: boolean): void {
+    this.resultPending = value;
+    if (this.request !== undefined) {
+      this.request.storage.setOrCreate('isGettingPickerData', value);
+    } else {
+      AppStorage.setOrCreate('isGettingPickerData', value);
+    }
+    this.refreshUI();
+  }
+
+  private queryFailed(): void {
+    if (!this.isActive()) { return; }
+    this.setBusy(false);
+    if (this.request !== undefined) {
+      this.request.finish({ resultCode: -1 });
+    }
+  }
+
+  public dispose(): void {
+    if (this.disposed) { return; }
+    this.disposed = true;
+    this.generation++;
+    this.searchGeneration++;
+    this.resultGeneration++;
+    this.queryScope.dispose();
+    this.resultScope?.dispose();
+    for (const task of this.tasks) {
+      try { taskpool.cancel(task); } catch (error) { HiLog.w(TAG, 'Query already running'); }
+    }
+    this.tasks.clear();
+    this.refreshUI = () => {};
+    this.clearAllData();
+    this.favoriteContactIdSet.clear();
+    this.defaultSelectContactMap.clear();
+    this.contactSearchList = [];
+    this.inputKeyword = '';
+    this.selectedCount = 0;
+    this.contactsSource = new ContactPickerDataSource();
+    this.favoriteSource = new ContactPickerDataSource();
+    this.selectedSource = new ContactPickerDataSource();
+    this.searchContactsSource = new ContactPickerDataSource();
+  }
+
   private constructor() {
   }
 
   public static getInstance(): ContactsPickerPresenter {
-    if (ContactsPickerPresenter.sInstance == null) {
+    if (ContactsPickerPresenter.sInstance == null || ContactsPickerPresenter.sInstance.disposed) {
       ContactsPickerPresenter.sInstance = new ContactsPickerPresenter();
     }
     return ContactsPickerPresenter.sInstance;
@@ -179,9 +260,10 @@ export default class ContactsPickerPresenter {
     }, isDisplayByName: ${this.isDisplayByName}, selectLimit: ${this.selectLimit
     }, filter is None: ${this.filter === undefined}, isSaveExistContact: ${this.isSaveExistContact}`)
     this.checkTheParameterType();
+    if (!this.isActive()) { return; }
     this.preInitContactList(this.userId);
     this.refreshPageMessage();
-    AppStorage.setOrCreate('isGettingPickerData', false);
+    this.setBusy(false);
   }
 
   clearAllData() {
@@ -197,7 +279,7 @@ export default class ContactsPickerPresenter {
 
   aboutToDisAppear() {
     HiLog.w(TAG, `aboutToDisAppear...`);
-    this.clearAllData();
+    if (this.request === undefined) { this.dispose(); }
   }
 
   initNavPaths(pageInfos: NavPathStack) {
@@ -271,7 +353,7 @@ export default class ContactsPickerPresenter {
       AccessibilityUtil.getInstance().sendAllSelectedOrDeselected(false, this.selectedCount);
       this.selectedCount = 0;
     }
-    emitter.emit(ContactsPickerPresenter.BATCH_SELECT_ITEM_CHECKED);
+    emitter.emit(this.selectionChangedEvent);
     this.refreshPageMessage();
   }
 
@@ -293,7 +375,7 @@ export default class ContactsPickerPresenter {
     let eventData: emitter.EventData = {
       data: { 'contactId': contactId }
     };
-    emitter.emit(ContactsPickerPresenter.BATCH_SELECT_ITEM_CHECKED, eventData);
+    emitter.emit(this.selectionChangedEvent, eventData);
     this.refreshPageMessage();
   }
 
@@ -383,7 +465,7 @@ export default class ContactsPickerPresenter {
         this.selectedContactsMap.set(contactId, subData);
       }
     }
-    emitter.emit(ContactsPickerPresenter.BATCH_SELECT_ITEM_CHECKED);
+    emitter.emit(this.selectionChangedEvent);
   }
 
   initSelectedDataSource() {
@@ -422,7 +504,8 @@ export default class ContactsPickerPresenter {
   }
 
   // picker 返回数据
-  confirm(contactIdPickerDataMap: Map<number, contact.Contact>, isFinish: boolean = true) {
+  async confirm(contactIdPickerDataMap: Map<number, contact.Contact>, isFinish: boolean = true) {
+    if (!this.isActive()) { return; }
     try {
       HiLog.w(TAG, `confirm! isContactsPicker: ${this.isContactsPicker}`);
 
@@ -455,9 +538,10 @@ export default class ContactsPickerPresenter {
         'want': want
       };
 
+      const chunks: Record<string, Object>[] = [];
       if (!this.isContactsPicker) {
         // 兼容 uiExtension 方式 调用联系人picker，不支持大数据量传输
-        ContactsGlobalThisHelper.GetGlobalThis().getUIExtensionContentSession()?.sendData(resultData);
+        chunks.push(resultData);
       } else {
         // 兼容 数据库方式 调用联系人picker，大数据量分批传输
         let index = 0;
@@ -477,21 +561,20 @@ export default class ContactsPickerPresenter {
             'index': index,
             'total': total
           };
-          ContactsGlobalThisHelper.GetGlobalThis().getUIExtensionContentSession()?.sendData(parameters);
+          chunks.push(parameters);
           index++;
         } while (pickerDataResult.length > 0)
         HiLog.w(TAG, `sendData end`);
       }
 
-      // 兼容 通过 startAbility 方式调用数据（只支持单选）
-      ContactsGlobalThisHelper.GetGlobalThis()
-        .getDefaultUIContext()?.terminateSelfWithResult(result)
-        .then(() => {
-          HiLog.w(TAG, 'terminateSelfWithResult Operation succeeded ');
-        })
-        .catch((error: BusinessError) => {
-          HiLog.e(TAG, 'Operation failed. Cause: %s', error?.message);
-        });
+      if (this.request !== undefined) {
+        const delivered = await this.request.deliver(chunks, result);
+        if (!delivered) { return; }
+      } else {
+        const session = ContactsGlobalThisHelper.GetGlobalThis().getUIExtensionContentSession();
+        for (const chunk of chunks) { session?.sendData(chunk); }
+        await this.getContext()?.terminateSelfWithResult(result);
+      }
 
       // 点击完成才增加访问记录
       if (isFinish) {
@@ -499,9 +582,10 @@ export default class ContactsPickerPresenter {
       }
     } catch (error) {
       HiLog.e(TAG, `confirm error: ${error?.message}`);
+      this.queryFailed();
     } finally {
       HiLog.w(TAG, 'isGettingPickerData set false.');
-      AppStorage.setOrCreate('isGettingPickerData', false);
+      if (this.isActive()) { this.setBusy(false); }
     }
   }
 
@@ -614,13 +698,15 @@ export default class ContactsPickerPresenter {
 
   // 初始化数据
   initContactList() {
+    if (!this.isActive()) { return; }
+    const generation = this.generation;
     HiLog.w(TAG, `initContactsList start! page: ${this.page}`);
     ContactListPresenter.getInstance().getPhotosInfoAsync(this.userId).then(() => {
+      if (!this.isActive() || generation !== this.generation) { return; }
       if (!this.hasChecked) {
         // 先查下收藏联系人
-        ContactsGlobalThisHelper.GetGlobalThis()
-          .getValue<WorkerWrapper>(ContactsGlobalThisHelper.DataWorkerName)?.sendRequest('getPickerContacts', {
-          'context': ContactsGlobalThisHelper.GetGlobalThis().getDefaultUIContext(),
+        this.getWorker()?.sendRequest('getPickerContacts', {
+          'context': this.getContext(),
           'isDisplayByName': this.isDisplayByName,
           'contactSelectionFilter': this.filter,
           'userId': this.userId,
@@ -628,6 +714,8 @@ export default class ContactsPickerPresenter {
           'isFavorite': true,
           'isOnePageShow': false,
         }, (result: PickerContactList) => {
+          if (!this.isActive() || generation !== this.generation) { return; }
+          if (!result) { this.queryFailed(); return; }
           HiLog.i(TAG, `favoritecontactList size: ${result.contactList.length}`);
           let favoriteContactListTmp = this.favoriteContactList;
           let favoriteContactIdListTmp = this.favoriteContactIdSet;
@@ -665,12 +753,11 @@ export default class ContactsPickerPresenter {
               this.defaultSelectContactMap.set(key, value);
             }
           });
-        })
+        }, this.queryScope)
       }
 
-      ContactsGlobalThisHelper.GetGlobalThis()
-        .getValue<WorkerWrapper>(ContactsGlobalThisHelper.DataWorkerName)?.sendRequest('getPickerContacts', {
-        'context': ContactsGlobalThisHelper.GetGlobalThis().getDefaultUIContext(),
+      this.getWorker()?.sendRequest('getPickerContacts', {
+        'context': this.getContext(),
         'isDisplayByName': this.isDisplayByName,
         'contactSelectionFilter': this.filter,
         'userId': this.userId,
@@ -678,6 +765,8 @@ export default class ContactsPickerPresenter {
         'isFavorite': false,
         'isOnePageShow': this.isOnePageShow,
       }, (result: PickerContactList) => {
+          if (!this.isActive() || generation !== this.generation) { return; }
+          if (!result) { this.queryFailed(); return; }
         HiLog.w(TAG, `getPickerContacts success. page: ${this.page}, isEnd: ${result.isEnd}, contactList size:
           ${result.contactList.length}, defaultSelectContactMap size: ${result.defaultSelectContactMap.size}`);
         if (this.page == 0 && !this.isOnePageShow && this.totalCount <= this.onePageDataLength) {
@@ -750,70 +839,63 @@ export default class ContactsPickerPresenter {
           if (this.page == 0 && this.totalCount <= this.onePageDataLength && this.isOnePageShow) {
             this.page = 0;
             this.isOnePageShow = false;
-            setTimeout(() => {
+            const update = () => {
+              if (!this.isActive() || generation !== this.generation) { return; }
               this.contactsListInited = true;
               this.refreshPageMessage();
-            }, 750)
+            };
+            if (this.request !== undefined) { this.request.delay(update, 750); }
+            else { setTimeout(update, 750); }
           } else {
             this.page++;
           }
           HiLog.w(TAG, `initContactList again, page: ${this.page}`);
           this.initContactList();
         }
-      });
-    });
+      }, this.queryScope);
+    }).catch(() => { if (generation === this.generation) { this.queryFailed(); } });
   }
 
   // 初始化数据
   async preInitContactList(userId: number) {
-    // 查询数据前先给原来数据全清空掉
-    this.clearAllData();
-    HiLog.w(TAG, `preInitContactList start! filter is undefined: ${this.filter == undefined}, userId: ${userId}`);
-    ContactListPresenter.getInstance().getPhotosInfoAsync(userId);
-    // 先查一遍总数
-    let countAlphabetIndex = await ContactAbilityModel.getAllContactSizeSync(userId, true);
-    let total = (countAlphabetIndex as CountAlphabetIndex).count;
-    let forNum: number = Math.ceil(total / 10000);
-    HiLog.i(TAG, `preInitContactList getAllContactSizeSync current total: ${total}, forNum: ${forNum}`);
-    let result: PickerContactList = {
-      contactList: [],
-      defaultSelectContactMap: new Map(),
-      isEnd: false
-    };
-    let resultMap: Map<number, PickerContactList> = new Map<number, PickerContactList>();
-    let promiseList: Promise<boolean>[] = []
-    for (let i = 0; i < forNum; i++) {
-      promiseList.push(new Promise(async (resolve) => {
-        let task1: taskpool.Task;
-        this.isOnePageShow = i == 0 ? true : false;
-        if (this.filter !== undefined) {
-          task1 = new taskpool.Task(getPickerContactsByFilter, this.isDisplayByName, this.filter, userId, i, false,
-            this.isOnePageShow, ContactsGlobalThisHelper.GetGlobalThis().getDefaultUIContext());
-        } else {
-          task1 = new taskpool.Task(getPickerContactsNoFilter, this.isDisplayByName, userId, i, false,
-            this.isOnePageShow, ContactsGlobalThisHelper.GetGlobalThis().getDefaultUIContext());
-        }
-        taskpool.execute(task1).then((data: object) => {
-          let pickerContactList = data as PickerContactList;
-          resultMap.set(i, pickerContactList);
-          HiLog.w(TAG, `initContactList page: ${i} queryAllEnd: ${pickerContactList.isEnd},
-            contactListSize: ${pickerContactList.contactList.length}`);
-          resolve(true);
-        });
-      }));
+    const generation = ++this.generation;
+    this.queryScope.dispose();
+    this.queryScope = new WorkerRequestScope();
+    this.searchGeneration++;
+    for (const task of this.tasks) {
+      try { taskpool.cancel(task); } catch (error) { HiLog.w(TAG, 'Prior query already running'); }
     }
-    await Promise.all(promiseList).then(() => {
-      for (let i = 0; i < resultMap.size; i++) {
-        let temp = resultMap.get(i) as PickerContactList;
-        result.contactList.push(...temp.contactList);
-        temp.defaultSelectContactMap.forEach((value, key) => {
-          result.defaultSelectContactMap.set(key, value);
-        })
+    this.tasks.clear();
+    this.clearAllData();
+    try {
+      const count = await ContactAbilityModel.getAllContactSizeSync(userId, true) as CountAlphabetIndex;
+      if (!this.isActive() || generation !== this.generation) { return; }
+      const pageCount = Math.ceil(count.count / 10000);
+      const queries: Promise<PickerContactList>[] = [];
+      for (let page = 0; page < pageCount; page++) {
+        const task = this.filter !== undefined ?
+          new taskpool.Task(getPickerContactsByFilter, this.isDisplayByName, this.filter, userId,
+            page, false, page === 0, this.getContext()) :
+          new taskpool.Task(getPickerContactsNoFilter, this.isDisplayByName, userId,
+            page, false, page === 0, this.getContext());
+        this.tasks.add(task);
+        queries.push(taskpool.execute(task).then((data: Object) => data as PickerContactList)
+          .finally(() => { this.tasks.delete(task); }));
+      }
+      const pages = await Promise.all(queries);
+      if (!this.isActive() || generation !== this.generation) { return; }
+      const result: PickerContactList = { contactList: [], defaultSelectContactMap: new Map(), isEnd: true };
+      for (const page of pages) {
+        result.contactList.push(...page.contactList);
+        page.defaultSelectContactMap.forEach((value, key) => result.defaultSelectContactMap.set(key, value));
       }
       this.refreshContactPickerList(result);
-    }).catch((error: Error) => {
-      HiLog.e(TAG, `Error in Promise.all: ${error?.message}`);
-    });
+    } catch (error) {
+      if (generation === this.generation && this.isActive()) {
+        HiLog.e(TAG, 'Contact query failed: ' + error?.message);
+        this.queryFailed();
+      }
+    }
   }
 
   refreshContactPickerList(result: PickerContactList) {
@@ -920,6 +1002,8 @@ export default class ContactsPickerPresenter {
   * Search for Contacts
    */
   getSearchContactResultFromDb(value: string) {
+    if (!this.isActive()) { return; }
+    this.searchGeneration++;
     HiLog.w(TAG, 'getSearchContactResultFromDb start!!');
     this.contactSearchList = [];
     this.contactSearchOffset = 0;
@@ -952,9 +1036,14 @@ export default class ContactsPickerPresenter {
   }
 
   contactSearchTaskFromDb() {
+    if (!this.isActive()) { return; }
+    const generation = this.searchGeneration;
     HiLog.w(TAG, `contactSearchTaskFromDb start, contactSearchOffset: ${this.contactSearchOffset}`);
-    this.task = new taskpool.Task(updateSearchPickerListFromDb, this.inputKeyword, this.contactSearchOffset,ContactsGlobalThisHelper.GetGlobalThis().getDefaultUIContext());
+    this.task = new taskpool.Task(updateSearchPickerListFromDb, this.inputKeyword, this.contactSearchOffset,this.getContext());
+    const task = this.task;
+    this.tasks.add(task);
     taskpool.executeDelayed(DELAY_TIME, this.task, taskpool.Priority.HIGH).then((searchResultsObject: Object) => {
+      if (!this.isActive() || generation !== this.searchGeneration) { return; }
       let searchResults: SearchContactResult[] = searchResultsObject as SearchContactResult[];
       HiLog.w(TAG, `contactSearchTaskFromDb searchResults size: ${searchResults.length}`);
       this.contactSearchOffset += searchResults.length;
@@ -1001,8 +1090,9 @@ export default class ContactsPickerPresenter {
       //   this.contactSearchTask();
       // }
     }).catch((error: BusinessError) => {
+      if (this.isActive() && generation === this.searchGeneration) { this.queryFailed(); }
       HiLog.e(TAG, `contactSearchTaskFromDb error: ${error.message}`);
-    })
+    }).finally(() => { this.tasks.delete(task); });
   }
 
 
@@ -1098,28 +1188,25 @@ export default class ContactsPickerPresenter {
   //   })
   // }
 
-  getPickerDataByIds(
-    contactIds: Set<number>, callBack: (contactIdPickerDataMap: Map<number, contact.Contact>) => void) {
-    HiLog.w(TAG, `getPickerDataByIds all start, contactIds size: ${contactIds.size}.`);
-    if (AppStorage.get<boolean>('isGettingPickerData')) {
-      HiLog.w(TAG, `is getting picker data.`);
-      return;
-    }
-    AppStorage.setOrCreate('isGettingPickerData', true);
-
-    ContactsGlobalThisHelper.GetGlobalThis()
-      .getValue<WorkerWrapper>(ContactsGlobalThisHelper.DataWorkerName)
-      .sendRequest('getPickerDataByIds', {
-        context: ContactsGlobalThisHelper.GetGlobalThis().getDefaultUIContext(),
-        contactIds: Array.from(contactIds),
-        userId: this.userId,
-      }, (contactIdPickerDataMap: Map<number, contact.Contact>) => {
-        if (contactIdPickerDataMap.size <= 0) {
-          HiLog.e(TAG, 'getPickerDataByIds failed , result is null ');
-        }
-        HiLog.w(TAG, 'getPickerDataByIds end');
-        callBack(contactIdPickerDataMap);
-      })
+  getPickerDataByIds(contactIds: Set<number>,
+    callBack: (contactIdPickerDataMap: Map<number, contact.Contact>) => void) {
+    if (!this.isActive() || this.resultPending) { return; }
+    const generation = ++this.resultGeneration;
+    const scope = new WorkerRequestScope();
+    this.resultScope?.dispose();
+    this.resultScope = scope;
+    this.setBusy(true);
+    if (contactIds.size === 0) { scope.dispose(); callBack(new Map()); return; }
+    const worker = this.getWorker();
+    if (worker === undefined) { scope.dispose(); this.queryFailed(); return; }
+    worker.sendRequest('getPickerDataByIds', {
+      context: this.getContext(), contactIds: Array.from(contactIds), userId: this.userId
+    }, (data: Map<number, contact.Contact> | undefined) => {
+      scope.dispose();
+      if (!this.isActive() || generation !== this.resultGeneration) { return; }
+      if (data === undefined) { this.queryFailed(); return; }
+      callBack(data);
+    }, scope);
   }
 
   checkTheParameterType() {
@@ -1159,10 +1246,12 @@ export default class ContactsPickerPresenter {
     HiLog.w(TAG, `checkTheParameterType result code: ${result?.code}, name: ${result?.name},
      message: ${result?.message}`);
     if (result.code !== 0) {
-      ContactsGlobalThisHelper.GetGlobalThis()
-        .getDefaultUIContext()?.terminateSelfWithResult({
-        resultCode: result.code
-      })
+      if (this.request !== undefined) {
+        this.request.finish({ resultCode: result.code });
+      } else {
+        this.getContext()?.terminateSelfWithResult({ resultCode: result.code });
+      }
+      this.dispose();
     }
   }
 
@@ -1206,6 +1295,10 @@ export default class ContactsPickerPresenter {
   }
 
   returnDefaultSelectContactData() {
+    if (!this.isActive()) { return; }
+    this.resultScope?.dispose();
+    this.resultGeneration++;
+    this.setBusy(false);
     HiLog.w(TAG, `returnDefaultSelectContactData. defaultSelectContactMap size: ${this.defaultSelectContactMap.size}`);
     this.selectedContactsMap.clear();
     let ids: Set<number> = new Set();
@@ -1220,6 +1313,7 @@ export default class ContactsPickerPresenter {
 
   public static unInstance(): void {
     HiLog.i(TAG, 'unInstance...');
+    ContactsPickerPresenter.sInstance?.dispose();
     ContactsPickerPresenter.sInstance = null;
   }
 }

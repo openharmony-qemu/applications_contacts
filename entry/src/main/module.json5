@@ -53,9 +53,7 @@
             "uris": [
               {
                 "scheme": "tel"
-              }
-            ],
-            'uris': [
+              },
               {
                 "scheme": "calllog",
                 "host": "voice",

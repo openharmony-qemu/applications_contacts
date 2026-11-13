@@ -40,6 +40,30 @@ export class WorkerMessage {
  *
  * Processes sending tasks to workers and receiving work processing results.
  */
+// Optional request ownership; disposing one scope never closes a shared worker.
+export class WorkerRequestScope {
+  public active: boolean = true;
+  private cleanups: Set<() => void> = new Set();
+
+  onDispose(cleanup: () => void): () => void {
+    if (!this.active) { cleanup(); return () => {}; }
+    this.cleanups.add(cleanup);
+    return () => { this.cleanups.delete(cleanup); };
+  }
+
+  dispose(): void {
+    if (!this.active) { return; }
+    this.active = false;
+    const cleanups = Array.from(this.cleanups).reverse();
+    this.cleanups.clear();
+    for (const cleanup of cleanups) {
+      try { cleanup(); } catch (error) {
+        HiLog.e(TAG, 'Request cleanup failed: ' + error?.message);
+      }
+    }
+  }
+}
+
 export default class WorkerWrapper {
   protected mWorker?: worker.ThreadWorker;
   private callBacks: Map<string, Function> = new Map();
@@ -128,7 +152,11 @@ export default class WorkerWrapper {
    * @param {Object} requestData  request param Data
    * @param {Object} callBack Call back from worker
    */
-  public async sendRequest (request: string, requestData?: LooseObject, callBack?: Function) {
+  public async sendRequest (request: string, requestData?: LooseObject, callBack?: Function,
+    scope?: WorkerRequestScope) {
+    if (scope !== undefined) {
+      return this.sendScopedRequest(request, requestData, callBack, scope);
+    }
     let log: UtilAuditLog = await assembleLogUtils(request, requestData);
     try {
       if (!this.useWorker) {
@@ -180,6 +208,54 @@ export default class WorkerWrapper {
   /**
    * Close  close worker thread.
    */
+  private async sendScopedRequest(request: string, requestData: LooseObject | undefined,
+    callBack: Function | undefined, scope: WorkerRequestScope): Promise<void> {
+    let target: Function | undefined = callBack;
+    let key: string | undefined = undefined;
+    let complete: boolean = false;
+    let remove: () => void = () => {};
+    remove = scope.onDispose(() => {
+      target = undefined;
+      if (key !== undefined) { this.callBacks.delete(key); }
+    });
+    const reply = (data: Object | undefined): void => {
+      if (complete || !scope.active) { return; }
+      complete = true;
+      const callback = target;
+      target = undefined;
+      remove();
+      if (key !== undefined) { this.callBacks.delete(key); }
+      callback?.(data);
+    };
+    // Drop the original closure even while audit logging is pending.
+    callBack = undefined;
+    if (!scope.active) { return; }
+    try {
+      const log = await assembleLogUtils(request, requestData);
+      if (!scope.active) { return; }
+      if (!this.useWorker) {
+        const task = WorkFactory.getTask(this.getWorkerType());
+        if (task === undefined) { throw new Error('Contact data task unavailable'); }
+        task.runInWorker(request, reply, requestData);
+      } else if (this.mWorker) {
+        const message = new WorkerMessage();
+        message.request = request;
+        message.callBackId = this.requestIndex++;
+        message.type = this.getWorkerType();
+        message.param = requestData;
+        message.log = log;
+        key = this.getCallBackKey(message);
+        this.callBacks.set(key, reply);
+        this.mWorker.postMessage(message);
+      } else {
+        await this.sendRequestUiThread(request, requestData, reply);
+      }
+    } catch (error) {
+      HiLog.e(TAG, 'Scoped contact query failed: ' + error?.message);
+      reply(undefined);
+    }
+  }
+
   public async close () {
     HiLog.i(TAG, `${this.getWorkerType()} worker close!`);
     await this.sendRequest('close');

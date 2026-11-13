@@ -40,6 +40,7 @@ import { DisplaySplitUtil } from '../util/DisplaySplitUtil'
 // import { AppLockManager } from '@hw-hmos/pickersheet'
 import { osAccount } from '@kit.BasicServicesKit'
 import ContactsPickerPresenter from '../presenter/contact/batchselectcontacts/ContactsPickerPresenter'
+import PickerSession from './PickerSession';
 
 const TAG = 'ContactUiExtentionAbility'
 
@@ -83,32 +84,20 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
   public mContactListPresenter: ContactListPresenter = ContactListPresenter.getInstance();
   public listenerManager: ListenerManager | null = null;
   private processorId: number = 0;
-  private runTime: number[] = [];
-  private sumTime: number = 0;
-  private succCount: number = 0;
-  private errCodes: Record<string, number> = {};
-  private startTime: number = 0;
-  private endTime: number = 0
-  private localId: number = 100;
-  private userId: number = 100;
   private startAbilityCallerBundleName: string = '';
+  private sessions: Map<UIExtensionContentSession, PickerSession> = new Map();
+  private destroyed: boolean = false;
 
-  constructor() {
-    super();
-    osAccount.getAccountManager().getOsAccountLocalId().then((localId) => {
-      this.localId = localId;
-    })
-  }
+  constructor() { super(); }
 
   parseContactParam(want: Want) {
     let uiExtentionParam: UiExtentionParam = new UiExtentionParam();
-    this.startTime = new Date().getTime()
     HiLog.i(TAG, 'Receive parameters');
     uiExtentionParam.urlType = want.parameters?.targetUrl as string
     uiExtentionParam.phoneNumber = want.parameters?.phoneNumber as string
     uiExtentionParam.contactId = want.parameters?.contactId as number
-    uiExtentionParam.callerBundleName = want.parameters!['ohos.aafwk.param.callerBundleName'] as string
-    uiExtentionParam.callerToken = want.parameters!['ohos.aafwk.param.callerToken'] as number
+    uiExtentionParam.callerBundleName = want.parameters?.['ohos.aafwk.param.callerBundleName'] as string
+    uiExtentionParam.callerToken = want.parameters?.['ohos.aafwk.param.callerToken'] as number
     uiExtentionParam.from = want.parameters?.from as string;
     uiExtentionParam.meetimeDeviceType = want.parameters?.meetimeDeviceType as DeviceTypeEnum;
     // 数据库调 picker 标志位
@@ -121,7 +110,6 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
     uiExtentionParam.isSaveContact = (want.parameters?.isSaveContact as boolean) ?? false;
     uiExtentionParam.contact = want.parameters?.contact as contact.Contact;
     uiExtentionParam.userId = want.parameters?.userId as number;
-    this.userId = want.parameters?.userId as number;
     uiExtentionParam.source = want.parameters?.source as string;
     uiExtentionParam.intelliGroupName = want.parameters?.intelliGroupName as string;
 
@@ -130,20 +118,6 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
      selectLimit: ${want?.parameters?.selectLimit}, isDisplayByName: ${want?.parameters?.isDisplayByName},
       isSaveExistContact: ${want?.parameters?.isSaveExistContact}, isSaveContact: ${want?.parameters?.isSaveContact},
        source: ${want?.parameters?.source}`);
-
-    this.endTime = new Date().getTime()
-    // 统计运行时间和成功次数
-    this.runTime.push(this.endTime - this.startTime);
-    this.sumTime += this.endTime - this.startTime;
-    this.succCount++;
-    if (!this.startTime) {
-      this.startTime = this.startTime;
-    }
-    setInterval(() => {
-      HiLog.w(TAG, `use DotUtil selectContact`)
-      HiAppEvent.getInstance().SchedulerUpload(this.processorId, uiExtentionParam.callerBundleName, this.startTime,
-        this.runTime, this.succCount, this.sumTime, -1)
-    }, 1000)
 
     HiLog.i(TAG, 'uiExtentionParam parse finish ')
     return uiExtentionParam
@@ -175,6 +149,9 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
   }
 
   onDestroy() {
+    this.destroyed = true;
+    for (const request of Array.from(this.sessions.values())) { request.dispose(); }
+    this.sessions.clear();
     HiLog.i(TAG, `ContactUiExtentionAbility onDestroy`)
     try {
       // AppLockManager.Helper.setPickerProtectedState([{ bundleName: this.startAbilityCallerBundleName, appIndex: 0 }],
@@ -229,6 +206,55 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
   }
 
   async onSessionCreate(want: Want, session: UIExtensionContentSession) {
+    if (this.destroyed || this.sessions.has(session)) { return; }
+    let request: PickerSession | undefined = undefined;
+    try {
+      const started = Date.now();
+      const params = this.parseContactParam(want);
+      const duration = Date.now() - started;
+      const durations: number[] = [duration];
+      request = new PickerSession(session, this.context, params, this.mDataWorker);
+      const current = request;
+      this.sessions.set(session, current);
+      current.addCleanup(() => {
+        if (this.sessions.get(session) === current) { this.sessions.delete(session); }
+        const globals = ContactsGlobalThisHelper.GetGlobalThis();
+        if (globals.getUIExtensionContentSession() === session) {
+          globals.remove(ContactsGlobalThisHelper.UiExtentionAbilityUIExtensionContentSession);
+          if (globals.getValue<UiExtentionParam>(ContactsGlobalThisHelper.UiExtentionAbilityParams) === params) {
+            globals.remove(ContactsGlobalThisHelper.UiExtentionAbilityParams);
+          }
+        }
+        if (this.sessions.size === 0 && globals.getValue(ContactsGlobalThisHelper.UIContextName) === this.context) {
+          globals.remove(ContactsGlobalThisHelper.UIContextName);
+        }
+      });
+      current.storage.setOrCreate('pickerPresenter', ContactsPickerPresenter.createForSession(current));
+      current.storage.setOrCreate('callerPid', String(want.parameters?.['ohos.aafwk.param.callerPid'] ?? ''));
+      const timer = setInterval(() => {
+        if (!current.active) { return; }
+        HiAppEvent.getInstance().SchedulerUpload(this.processorId, params.callerBundleName,
+          started, durations, 1, duration, -1);
+      }, 1000);
+      current.addCleanup(() => clearInterval(timer));
+      const localAccountId = await osAccount.getAccountManager().getOsAccountLocalId();
+      if (!current.active) { return; }
+      await this.openSession(want, current, localAccountId);
+    } catch (error) {
+      HiLog.e(TAG, 'Contact picker session failed: ' + error?.message);
+      if (request !== undefined) {
+        await request.finish({ resultCode: -1 });
+        request.dispose();
+      } else {
+        try { await session.terminateSelfWithResult({ resultCode: -1 }); } catch (_) {}
+      }
+    }
+  }
+
+  private async openSession(want: Want, request: PickerSession, localAccountId: number) {
+    const session = request.session;
+    const uiExtentionParam = request.params;
+    const storage = request.storage;
     try {
       HiLog.i(TAG, `ContactUiExtentionAbility onSessionCreate`)
       // 安全截屏设置
@@ -246,7 +272,7 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
       AccessibilityUtil.getInstance().getAccessibilitySwitchState();
 
       // 参数解析
-      let uiExtentionParam: UiExtentionParam = this.parseContactParam(want)
+      if (!request.active) { return; }
 
       // 设置全局参数
       ContactsGlobalThisHelper.GetGlobalThis()
@@ -273,20 +299,19 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
       AppStorage.setOrCreate('currentColorMode', this.context?.config?.colorMode);
 
       // 设置全局 storage
-      let storageParamObj: LooseObject = {
-        'uiExtentionSession': session,
-        'parameters': uiExtentionParam,
+      const foldChanged = (status: display.FoldStatus) => {
+        if (request.active) { AppStorage.setOrCreate('isVerdeModel', ScreenFormUtil.isNewFormSmallFoldScreen()); }
       };
-      let storage: LocalStorage = new LocalStorage(storageParamObj);
-
-      // 判断设备形态
-      ScreenFormUtil.addFoldStatusRegister();
+      foldChanged(display.getFoldStatus());
+      display.on('foldStatusChange', foldChanged);
+      request.addCleanup(() => display.off('foldStatusChange', foldChanged));
 
       // 判断是否显示子窗
       let subWindow: window.Window | undefined = undefined;
-      if(this.localId === 100 && this.userId !== undefined && this.userId !== 100) {
+      if(localAccountId === 100 && uiExtentionParam.userId !== undefined && uiExtentionParam.userId !== 100) {
         HiLog.i(TAG,'ContactUiExtentionAbility onSessionCreate terminateSelf')
-        this.context.terminateSelf()
+        await request.finish({ resultCode: 1 });
+        return;
       }
 
       // 加载窗口页面
@@ -294,7 +319,7 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
         (!(uiExtentionParam.isSaveContact || uiExtentionParam.isSaveExistContact))) {
         AppStorage.setOrCreate('callerPid', String(want?.parameters?.['ohos.aafwk.param.callerPid']));
         HiLog.w(TAG, `subWindow`);
-        const subWindowName = 'subWindowPicker'
+        const subWindowName = 'subWindowPicker' + request.id
         //创建子窗
         subWindow = await extensionWindow.createSubWindowWithOptions(subWindowName, {
           title: subWindowName,
@@ -302,23 +327,35 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
           isModal: false,
         });
 
-        display.on('change', async (data) => {
-          HiLog.w(TAG, `Succeeded in enabling the listener for display changes.`);
-          let newDisplay: display.Display = display.getDefaultDisplaySync();
-          HiLog.w(TAG, `newDisplay.orientation: ${newDisplay.orientation}, newDisplay.width: ${newDisplay.width},
-           newDisplay.height: ${newDisplay.height}`);
-          await subWindow?.resize(newDisplay.width, newDisplay.height)
-        })
+        const ownedWindow = subWindow;
+        request.addCleanup(() => { ownedWindow.destroyWindow().catch((error: Error) => {
+          HiLog.w(TAG, 'Contact subwindow closed: ' + error?.message);
+        }); });
+        if (!request.active) { return; }
+        const displayChanged = async (id: number) => {
+          if (!request.active) { return; }
+          try {
+            const size = display.getDefaultDisplaySync();
+            await ownedWindow.resize(size.width, size.height);
+          } catch (error) { HiLog.w(TAG, 'Display resize failed: ' + error?.message); }
+        };
+        display.on('change', displayChanged);
+        request.addCleanup(() => display.off('change', displayChanged));
 
         let newDisplay: display.Display = display.getDefaultDisplaySync();
         await subWindow?.resize(newDisplay.width, newDisplay.height)
+        if (!request.active) { return; }
         await subWindow.setWindowTouchable(true);
+        if (!request.active) { return; }
         // 在SubWindowPage中拉起PIcker
         await subWindow?.loadContent('pages/ContactUiExtentionIndex', storage);
+        if (!request.active) { return; }
         subWindow?.setWindowBackgroundColor('#00000000'); //设置窗口透明
         subWindow?.setShadow(0.0); // 禁止子窗阴影边框
         await subWindow?.showWindow();
+        if (!request.active) { return; }
         await subWindow.setFollowParentWindowLayoutEnabled(true);
+        if (!request.active) { return; }
       } else if (URL_TYPE_CONTACT_LIST == uiExtentionParam?.urlType ||
         URL_TYPE_CONTACT_DETAIL === uiExtentionParam?.urlType) {
         this.initSplitInfo(uiExtentionParam?.meetimeDeviceType);
@@ -326,6 +363,7 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
         AppStorage.setOrCreate('isMeetimePC', uiExtentionParam?.meetimeDeviceType === DeviceTypeEnum.PC);
         AppStorage.setOrCreate('isMeetimePhone', uiExtentionParam?.meetimeDeviceType === DeviceTypeEnum.HANDSET);
         session?.setReceiveDataCallback((data) => {
+          if (!request.active) { return; }
           const action = data?.action as string;
           const extraInfo = data?.extraInfo as string;
           HiLog.i(TAG, 'receivedata: ' + extraInfo);
@@ -335,14 +373,17 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
             this.handleJumpToCspButtonVisibility(isNeedSplit);
           }
         })
-        this.listenerManager = new ListenerManager();
-        this.listenerManager.registerListeners();
+        request.addCleanup(() => session.setReceiveDataCallback(() => {}));
+        const listeners = new ListenerManager();
+        listeners.registerListeners();
+        request.addCleanup(() => listeners.unRegisterListeners());
         CallServiceManager.getInstance().updateMeetimeLoginFlag();
         if (URL_TYPE_CONTACT_DETAIL === uiExtentionParam?.urlType) {
           AppStorage.setOrCreate('isFromMeeTimeDetail', uiExtentionParam?.from === 'meetime');
         }
         // 获取联系人列表第一页的数据后再加载页面，避免闪烁
         this.mContactListPresenter.startPreInit(() => {
+          if (!request.active) { return; }
           session.loadContent('pages/ContactUiExtentionIndex', storage);
           session.setWindowBackgroundColor('#00000000');
         });
@@ -352,6 +393,7 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
         session.setWindowBackgroundColor('#00000000');
       }
 
+      if (!request.active) { return; }
       // 设置窗口监听
       try {
         if (subWindow) {
@@ -360,24 +402,30 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
             subWindow.getWindowProperties().windowRect, subWindow.getWindowProperties().displayId));
           BreakpointUtil.judgingVerdeBreakpoint(
             subWindow.getWindowProperties().windowRect, subWindow.getWindowProperties().displayId);
-          subWindow.on('windowSizeChange', (data) => {
+          const subSizeChanged = (data: window.Size) => {
+            if (!request.active) { return; }
             AppStorage.setOrCreate('breakpoint',
               BreakpointUtil.getWidthBreakpoint(data, subWindow?.getWindowProperties().displayId));
             BreakpointUtil.judgingVerdeBreakpoint(data, subWindow?.getWindowProperties().displayId);
-          });
+          };
+          subWindow.on('windowSizeChange', subSizeChanged);
+          request.addCleanup(() => subWindow?.off('windowSizeChange', subSizeChanged));
 
           // 窗口内容规避区域
           let avoidArea = subWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
           let navigationArea = subWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR);
           this.updateWindowFullScreenPadding(avoidArea.topRect.height, navigationArea.bottomRect.height)
-          subWindow.on('avoidAreaChange', (data) => {
+          const subAvoidChanged = (data: window.AvoidAreaOptions) => {
+            if (!request.active) { return; }
             if (window.AvoidAreaType.TYPE_SYSTEM === data.type) {
               this.updateWindowFullScreenPadding(data.area.topRect.height, -1);
             }
             if (window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR === data.type) {
               this.updateWindowFullScreenPadding(-1, data.area.bottomRect.height)
             }
-          });
+          };
+          subWindow.on('avoidAreaChange', subAvoidChanged);
+          request.addCleanup(() => subWindow?.off('avoidAreaChange', subAvoidChanged));
         } else {
           let windowProxy = session.getUIExtensionHostWindowProxy();
 
@@ -387,31 +435,37 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
           AppStorage.setOrCreate('meetimeCurBp',
             BreakpointUtil.getWidthBreakpoint(windowProxy.properties.uiExtensionHostWindowProxyRect));
           BreakpointUtil.judgingVerdeBreakpoint(windowProxy.properties.uiExtensionHostWindowProxyRect);
-          windowProxy.on('windowSizeChange', (data) => {
+          const hostSizeChanged = (data: window.Size) => {
+            if (!request.active) { return; }
             AppStorage.setOrCreate('breakpoint', BreakpointUtil.getWidthBreakpoint(data));
             AppStorage.setOrCreate('meetimeCurBp', BreakpointUtil.getWidthBreakpoint(data));
             BreakpointUtil.judgingVerdeBreakpoint(data);
             DisplaySplitUtil.updateSplitStatus(data.width, data.height);
-          });
+          };
+          windowProxy.on('windowSizeChange', hostSizeChanged);
+          request.addCleanup(() => windowProxy?.off('windowSizeChange', hostSizeChanged));
 
           // 窗口内容规避区域
           let avoidArea = windowProxy.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
           let navigationArea = windowProxy.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR);
           this.updateWindowFullScreenPadding(avoidArea.topRect.height, navigationArea.bottomRect.height)
-          windowProxy.on('avoidAreaChange', (data) => {
+          const hostAvoidChanged = (data: window.AvoidAreaOptions) => {
+            if (!request.active) { return; }
             if (window.AvoidAreaType.TYPE_SYSTEM === data.type) {
               this.updateWindowFullScreenPadding(data.area.topRect.height, -1);
             }
             if (window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR === data.type) {
               this.updateWindowFullScreenPadding(-1, data.area.bottomRect.height)
             }
-          });
+          };
+          windowProxy.on('avoidAreaChange', hostAvoidChanged);
+          request.addCleanup(() => windowProxy?.off('avoidAreaChange', hostAvoidChanged));
         }
       } catch (err) {
         HiLog.e(TAG, `Failed to obtain the area. err: ${err?.message}`);
       }
     } catch (err) {
-      HiLog.e(TAG, `onSessionCreate err: ${err.message} ,err code: ${err.code}`)
+      throw new Error('Contact picker session setup failed: ' + (err as Error).message);
     }
   }
 
@@ -449,6 +503,7 @@ export default class ContactUiExtentionAbility extends UIExtensionAbility {
   }
 
   onSessionDestroy(session: UIExtensionContentSession) {
+    this.sessions.get(session)?.dispose();
     HiLog.i(TAG, `ContactUiExtentionAbility onSessionDestroy`)
   }
 }

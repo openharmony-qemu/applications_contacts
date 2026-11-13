@@ -50,6 +50,8 @@ import NameDisposal from '../../../feature/NameDisposal';
 import { PhoneNumber } from '../../../../../../../feature/phonenumber/src/main/ets/PhoneNumber';
 import { ContactVo } from '../../../model/bean/ContactVo';
 import ContactsPickerPresenter from '../../../presenter/contact/batchselectcontacts/ContactsPickerPresenter';
+import PickerSession from '../../../uiExtentionAbility/PickerSession';
+import { WorkerRequestScope } from '../../../workers/base/WorkerWrapper';
 import { BusinessError, commonEventManager, osAccount } from '@kit.BasicServicesKit';
 import IndexPresenter from '../../../presenter/IndexPresenter';
 import CallRecordPresenter from '../../../presenter/dialer/callRecord/CallRecordPresenter';
@@ -96,7 +98,6 @@ export function ContactsPickerSinglePageLoader($$: Params): void {
   ContactsPickerPage({ isContactMultiSelect: false });
 }
 
-let subscriber: commonEventManager.CommonEventSubscriber;
 
 let subscribeInfo: commonEventManager.CommonEventSubscribeInfo = {
   events: ['event.custom.contacts.VCARD_SHARE']
@@ -119,15 +120,40 @@ let subscribeInfo: commonEventManager.CommonEventSubscribeInfo = {
  */
 @Component
 export default struct ContactsPickerPage {
+  @LocalStorageLink('pickerSession') private pickerSession: PickerSession | undefined = undefined;
+  @LocalStorageLink('parameters') private sessionParameters: UiExtentionParam | undefined = undefined;
+  @LocalStorageLink('pickerPresenter') private sessionPresenter: ContactsPickerPresenter | undefined = undefined;
+  private pageScope: WorkerRequestScope = new WorkerRequestScope();
+
+  private mirrorLegacyFlags(propertyName: string): void {
+    const params = this.sessionParameters;
+    if (this.pickerSession !== undefined && !(params?.isSaveContact || params?.isSaveExistContact ||
+      params?.urlType === 'ContactList' || params?.urlType === 'ContactDetail')) { return; }
+    if (propertyName === 'isShowBindSheet') { AppStorage.setOrCreate('isShowBindSheet', this.isShowBindSheet); }
+    if (propertyName === 'isShowAccountants') { AppStorage.setOrCreate('isShowAccountants', this.isShowAccountants); }
+    if (propertyName === 'isSearching') { AppStorage.setOrCreate('isPickerSearch', this.isSearching); }
+  }
+  private subscriber?: commonEventManager.CommonEventSubscriber;
+  private titleMethodClass: TitleMethodClass = new TitleMethodClass();
+
+  private delay(action: () => void, milliseconds: number): void {
+    const scope = this.pageScope;
+    let remove: () => void = () => {};
+    const timer = setTimeout(() => {
+      remove();
+      if (scope.active && (this.pickerSession === undefined || this.pickerSession.active)) { action(); }
+    }, milliseconds);
+    remove = scope.onDispose(() => clearTimeout(timer));
+  }
+
   // 启动能力的调用者包名
   private startAbilityCallerBundleName =  AppStorage.get('startAbilityCallerBundleName') || '';
   // 调用者进程ID
   private callerPid =  AppStorage.get('callerPid') || '';
   // UI扩展参数，用于获取扩展能力相关信息
-  private uiExtentionParam = ContactsGlobalThisHelper.GetGlobalThis()
-    .getValue<UiExtentionParam>(ContactsGlobalThisHelper.UiExtentionAbilityParams);
+  private uiExtentionParam: UiExtentionParam | undefined = undefined;
   // UI扩展内容会话，用于与扩展能力通信
-  private session: UIExtensionContentSession = ContactsGlobalThisHelper.GetGlobalThis().getUIExtensionContentSession();
+  private session: UIExtensionContentSession | undefined = undefined;
   // 是否为多选模式
   private isContactMultiSelect: boolean = true;
   // 是否按名称显示联系人
@@ -175,13 +201,13 @@ export default struct ContactsPickerPage {
   @State selectedViewOffsetY: Length = '100%';
 
   // 是否显示账号列表
-  @StorageLink('isShowAccountants') isShowAccountants: boolean = false;
+  @LocalStorageLink('isShowAccountants') @Watch('mirrorLegacyFlags') isShowAccountants: boolean = false;
   // 是否显示绑定表单
-  @StorageLink('isShowBindSheet') isShowBindSheet: boolean = false;
+  @LocalStorageLink('isShowBindSheet') @Watch('mirrorLegacyFlags') isShowBindSheet: boolean = false;
   // 搜索框输入值
   @State changeValue: string = '';
   // 是否正在进行搜索
-  @StorageLink('isPickerSearch') isSearching: boolean = false;
+  @LocalStorageLink('isPickerSearch') @Watch('mirrorLegacyFlags') isSearching: boolean = false;
   // 已选联系人数量
   @State selectedCount: number = 0;
   // 联系人总数
@@ -193,7 +219,7 @@ export default struct ContactsPickerPage {
   // 是否启用加载视图
   @State loadingViewEnabled: boolean = false;
   // 是否正在获取选择器数据
-  @StorageProp('isGettingPickerData') isGettingPickerData: boolean = false;
+  @State isGettingPickerData: boolean = false;
   // 是否为PC设备
   private isPC: boolean = EnvironmentProp.isPC();
   // 是否为Verde设备
@@ -225,7 +251,7 @@ export default struct ContactsPickerPage {
   //       // type: IconStyleMode.SMALL,
   //       isEnabled: !this.isGettingPickerData,//返回按钮是否可用
   //       action: () => {
-  //         titleMethodClass.closeOnClick();//关闭页面
+  //         this.titleMethodClass.closeOnClick();//关闭页面
   //       }
   //     }
   //   }
@@ -248,7 +274,7 @@ export default struct ContactsPickerPage {
       .backgroundColor(this.isPC ? Color.Transparent : $r('app.color.skin_ohos_id_color_button_normal'))
       .id('Settings_close_btn')
       .onClick(() => {
-        titleMethodClass.closeOnClick();
+        this.titleMethodClass.closeOnClick();
       })
     }
     .justifyContent(FlexAlign.End)
@@ -271,8 +297,9 @@ export default struct ContactsPickerPage {
   private handleVcardShareSubscribeCB: (err: BusinessError, data: commonEventManager.CommonEventData) => void =
     (err: BusinessError, data: commonEventManager.CommonEventData) => {
       HiLog.i(TAG, `commonEvent subscribe event: ${data?.event}, bundleName: ${data?.bundleName}, code: ${data?.code}`);
-      if (data) {
-        titleMethodClass.closeOnClick();
+      if (data && this.pageScope.active &&
+        this.pickerSession === undefined) {
+        this.titleMethodClass.closeOnClick();
       } else {
         HiLog.i(TAG, 'commonEvent subscribe err:' + err?.message + ', stack: ' + err?.stack);
       }
@@ -284,30 +311,35 @@ export default struct ContactsPickerPage {
    * @param err - 创建订阅者过程中可能出现的错误
    * @param commonEventSubscriber - 创建成功的公共事件订阅者实例
    */
-  private createCB: (err: BusinessError, commonEventSubscriber: commonEventManager.CommonEventSubscriber) => void =
-    (err: BusinessError, commonEventSubscriber: commonEventManager.CommonEventSubscriber) => {
-      if (!err) {
-        subscriber = commonEventSubscriber;
-        try {
-          commonEventManager.subscribe(subscriber, this.handleVcardShareSubscribeCB);
-        } catch (error) {
-          HiLog.e(TAG, `Failed to subscribe. Code is ${error?.code}, message is ${error?.message}`);
-        }
-      } else {
-        HiLog.e(TAG, `Failed to create subscriber. Code is ${err.code}, message is ${err.message}`);
-      }
-    }
-
   /**
    * 注册公共事件订阅者
    * 用于订阅VCARD_SHARE事件，处理联系人分享功能
    */
   public async registerSubscriber() {
+    const scope = this.pageScope;
+    const request = this.pickerSession;
+    // The ordinary Contacts import UI emits this unaddressed broadcast.
+    // It cannot authorize terminating an independent public picker request.
+    if (request !== undefined) { return; }
     try {
-      commonEventManager.createSubscriber(subscribeInfo, this.createCB);
-    } catch (error) {
-      HiLog.e(TAG, `Failed to create subscriber. Code is ${error?.code}, message is ${error?.message}`);
-    }
+      commonEventManager.createSubscriber(subscribeInfo, (error, subscriber) => {
+        if (error) { HiLog.e(TAG, 'Subscriber creation failed: ' + error.message); return; }
+        if (!scope.active || scope !== this.pageScope || request !== this.pickerSession) {
+          try { commonEventManager.unsubscribe(subscriber, this.unsubscribeCB); } catch (_) {}
+          return;
+        }
+        this.subscriber = subscriber;
+        scope.onDispose(() => {
+          if (this.subscriber === subscriber) {
+            this.subscriber = undefined;
+            commonEventManager.unsubscribe(subscriber, this.unsubscribeCB);
+          }
+        });
+        commonEventManager.subscribe(subscriber, (err, data) => {
+          if (scope.active && scope === this.pageScope) { this.handleVcardShareSubscribeCB(err, data); }
+        });
+      });
+    } catch (error) { HiLog.e(TAG, 'Subscriber registration failed: ' + error?.message); }
   }
 
   /**
@@ -336,7 +368,9 @@ export default struct ContactsPickerPage {
    */
   public unsubscribe() {
     try {
-      commonEventManager.unsubscribe(subscriber, this.unsubscribeCB);
+      const subscriber = this.subscriber;
+      this.subscriber = undefined;
+      if (subscriber !== undefined) { commonEventManager.unsubscribe(subscriber, this.unsubscribeCB); }
     } catch (error) {
       HiLog.e(TAG, `Failed to unsubscribe. Code is ${error?.code}, message is ${error?.message}`);
     }
@@ -364,14 +398,27 @@ export default struct ContactsPickerPage {
    * 9. 配置滑动多选工具
    */
   async aboutToAppear() {
+    this.pageScope.dispose();
+    this.pageScope = new WorkerRequestScope();
+    const scope = this.pageScope;
+    this.pickerSession?.addCleanup(() => scope.dispose());
+    this.uiExtentionParam = this.sessionParameters;
+    this.session = this.pickerSession?.session;
+    this.mPresenter = this.sessionPresenter ?? ContactsPickerPresenter.getInstance();
     this.init();
     // 控制loading 页面闪屏
-    setTimeout(() => {
+    this.delay(() => {
       this.loadingViewEnabled = true;
       AccessibilityUtil.getInstance()
         .sendAccessibilityEvent(this.isOpenAccessibility, 'select_contact_title', 100);
     }, 2);
-    this.localId = await osAccount.getAccountManager().getOsAccountLocalId();
+    try {
+      this.localId = await osAccount.getAccountManager().getOsAccountLocalId();
+    } catch (error) {
+      if (scope.active) { this.pickerSession?.finish({ resultCode: -1 }); }
+      return;
+    }
+    if (!scope.active || (this.pickerSession !== undefined && !this.pickerSession.active)) { return; }
     HiLog.w(TAG, `localId: ${this.localId}`);
 
     // 参数处理逻辑：根据不同的调用方式初始化页面参数
@@ -403,6 +450,8 @@ export default struct ContactsPickerPage {
     // UI刷新回调配置：设置Presenter的UI刷新回调函数
     // 当数据发生变化时，Presenter会调用此回调更新页面UI
     this.mPresenter.refreshUI = () => {
+      if (!scope.active) { return; }
+      this.isGettingPickerData = this.mPresenter.resultPending;
       this.contactsListInited = this.mPresenter.contactsListInited;
       this.contactsTotal = this.mPresenter.totalCount;
       this.selectedCount = this.mPresenter.selectedCount;
@@ -420,18 +469,19 @@ export default struct ContactsPickerPage {
     this.mPresenter.aboutToAppear(this.isContactMultiSelect);
     this.showOnlyAccessedAlert();
 
-    titleMethodClass.backOnClick = () => {
+    this.titleMethodClass.backOnClick = () => {
       this.backToListView();
     }
     // 标题栏关闭按钮点击事件处理
-    titleMethodClass.closeOnClick = () => {
+    this.titleMethodClass.closeOnClick = () => {
       HiLog.w(TAG, `close button click, isGettingPickerData: ${this.isGettingPickerData}
         , isSaveExistContact: ${this.isSaveExistContact}, isShowBindSheet = ${this.isShowBindSheet}`);
       // 确保没有正在获取数据的操作
-      if (!this.isGettingPickerData) {
+      if (this.mPresenter.isActive()) {
         if (this.isSaveExistContact) {
           // 保存现有联系人模式：直接关闭并返回结果
-          this.session?.terminateSelfWithResult({ resultCode: 1 }).then(() => {
+          (this.pickerSession !== undefined ? this.pickerSession.finish({ resultCode: 1 }) :
+            this.session?.terminateSelfWithResult({ resultCode: 1 }))?.then(() => {
             HiLog.i(TAG, 'terminateSelfWithResult Operation succeeded ');
           }).catch((error: BusinessError) => {
             HiLog.e(TAG, `Operation failed. Cause: ${error?.message}`);
@@ -439,9 +489,7 @@ export default struct ContactsPickerPage {
         } else {
           // 联系人选择器模式：返回默认选中的数据
           this.isShowBindSheet = false;
-          setTimeout(() => {
-            this.mPresenter.returnDefaultSelectContactData();
-          }, 100);
+          this.mPresenter.returnDefaultSelectContactData();
         }
       }
     }
@@ -518,7 +566,9 @@ export default struct ContactsPickerPage {
   aboutToDisappear() {
     HiLog.w(TAG, 'aboutToDisappear')
     this.unInit();
-    emitter.off(ContactsPickerPresenter.BATCH_SELECT_ITEM_CHECKED);
+    this.pageScope.dispose();
+    this.mPresenter.refreshUI = () => {};
+    this.intelligenceGroupAddContactDialogControler?.close();
   }
 
   showOnlyAccessedAlert() {
@@ -584,8 +634,10 @@ export default struct ContactsPickerPage {
     if (this.mPresenter.searchSerInitStatus != 0) {
       let task = new taskpool.Task(initFusionSearchService);
       taskpool.execute(task).then((res: Object) => {
-        this.mPresenter.searchSerInitStatus = Number(res.toString());
-      });
+        if (this.pageScope.active && this.mPresenter.isActive()) {
+          this.mPresenter.searchSerInitStatus = Number(res.toString());
+        }
+      }).catch((error: Error) => HiLog.w(TAG, 'Search service unavailable: ' + error?.message));
     }
     if (this.isSearching) {
       return;
@@ -785,9 +837,7 @@ export default struct ContactsPickerPage {
                 })
                } else {
                 this.isShowBindSheet = false;
-                setTimeout(() => {
-                  this.mPresenter.selectBatchContact();
-                }, 100);
+                this.mPresenter.selectBatchContact();
               }
             })
             .alignRules({
@@ -1532,9 +1582,9 @@ struct ContactsPickerEmptyPage {
 
 @Component
 struct SecureAccessPopupTip {
+  @LocalStorageLink('parameters') private sessionParameters: UiExtentionParam | undefined = undefined;
   @Link isShowLearnMore: boolean
-  private uiExtentionParam = ContactsGlobalThisHelper.GetGlobalThis()
-    .getValue<UiExtentionParam>(ContactsGlobalThisHelper.UiExtentionAbilityParams);
+  private uiExtentionParam: UiExtentionParam | undefined = undefined;
   @Link isShowOnlyAccessedAlert: boolean;
   private isPC: boolean = EnvironmentProp.isPC();
   // 是否启动无障碍
@@ -1594,7 +1644,7 @@ struct SecureAccessPopupTip {
           .height(18)
           .onClick(() => {
             let list: string[] = AppStorage.get('showAccessedList') as string[];
-            let name: string = this.uiExtentionParam?.callerBundleName ?? '';
+            let name: string = this.sessionParameters?.callerBundleName ?? '';
             HiLog.w(TAG, `SecureAccessPopupTip xmark onClick, name: ${name}`);
             if (!StringUtil.isEmpty(name) && name !== 'com.ohos.contacts') {
               list.push(name);
@@ -1815,35 +1865,67 @@ struct ContactsPickerListItem {
     .opacity(1)
   }
 
-  updateInfo() {
-    this.checkedSet = this.presenter.selectedContactsMap.get(this.item.contactId) ?? new Set();
-    getPixelMapFromFileForContactPicker(this.item.contactId.toString(), this.localId, this.userId,
-      (res: PixelMap | null) => {
-        this.photoPixelMap = res;
-      }, ContactsGlobalThisHelper.GetGlobalThis().getDefaultUIContext(), false)
+  private itemGeneration: number = 0;
+  private selectionEvent: string | undefined = undefined;
+
+  private bindSelection(): void {
+    this.unbindSelection();
+    this.selectionEvent = this.presenter.selectionChangedEvent;
+    emitter.on(this.selectionEvent, this.selectionChanged);
   }
 
-  aboutToAppear() {
-    emitter.on(ContactsPickerPresenter.BATCH_SELECT_ITEM_CHECKED, (eventData: emitter.EventData) => {
+  private unbindSelection(): void {
+    if (this.selectionEvent !== undefined) {
+      emitter.off(this.selectionEvent, this.selectionChanged);
+      this.selectionEvent = undefined;
+    }
+  }
+  private itemActive: boolean = false;
+  private selectionChanged = (eventData: emitter.EventData): void => {
+    if (!this.itemActive || !this.presenter.isActive()) { return; }
       let contactId = eventData.data?.contactId as number;
 
       if (!this.isMultiSelect || !contactId || this.item.contactId === contactId) {
         this.checkedSet = this.presenter.selectedContactsMap.get(this.item.contactId) ?? new Set();
       }
-    })
+  };
+
+  updateInfo() {
+    const generation = ++this.itemGeneration;
+    const contactId = this.item.contactId;
+    this.checkedSet = this.presenter.selectedContactsMap.get(this.item.contactId) ?? new Set();
+    getPixelMapFromFileForContactPicker(this.item.contactId.toString(), this.localId, this.userId,
+      (res: PixelMap | null) => {
+        if (!this.itemActive || !this.presenter.isActive() || generation !== this.itemGeneration ||
+          contactId !== this.item.contactId) { return; }
+        this.photoPixelMap = res;
+      }, this.getUIContext().getHostContext(), false)
+  }
+
+  aboutToAppear() {
+    this.itemActive = true;
+    this.bindSelection();
     this.updateInfo();
     HiLog.i(TAG,`ContactsPickerListItem headChar:${this.item.headChar}, namePrefix:${this.item.namePrefix}
     ,isSearch:${this.isSearch}`)
   }
 
   aboutToReuse(): void {
+    this.bindSelection();
+    this.itemActive = true;
     this.updateInfo();
   }
 
   aboutToRecycle(): void {
+    this.unbindSelection();
+    this.itemActive = false;
+    this.itemGeneration++;
   }
 
   aboutToDisappear(): void {
+    this.itemActive = false;
+    this.itemGeneration++;
+    this.unbindSelection();
   }
 
 
@@ -2106,10 +2188,9 @@ class TitleMethodClass {
   }
 }
 
-let titleMethodClass = new TitleMethodClass()
 
 @Builder
-export function PickerTitleView($$: TitleVariableClass) {
+export function PickerTitleView($$: TitleVariableClass, methods: TitleMethodClass) {
   Row() {
     Row({ space: 8 }) {
       Button({ type: ButtonType.Circle, stateEffect: true }) {
@@ -2121,7 +2202,7 @@ export function PickerTitleView($$: TitleVariableClass) {
       }
       .onClick(() => {
         HiLog.w(TAG, 'onBackButtonClick');
-        titleMethodClass.backOnClick();
+        methods.backOnClick();
       })
       .accessibilityText(ContactsGlobalThisHelper.GetGlobalThis()
         .getDefaultUIContext()
@@ -2166,7 +2247,7 @@ export function PickerTitleView($$: TitleVariableClass) {
       .backgroundColor(EnvironmentProp.isPC() ? Color.Transparent : $r('app.color.skin_ohos_id_color_button_normal'))
       .draggable(false)
       .onClick(() => {
-        titleMethodClass.closeOnClick();
+        methods.closeOnClick();
       })
       .enabled(!$$.isGettingPickerData)
       .accessibilityText(AccessibilityUtil.getInstance()

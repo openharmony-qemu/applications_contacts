@@ -40,6 +40,8 @@ import EmitterConstant from '../data/EmitterConstant';
 // import appLock from '@hms.security.appLock';
 import { Constants } from '../data/Constants';
 import ContactsPickerPresenter from '../presenter/contact/batchselectcontacts/ContactsPickerPresenter';
+import PickerSession from '../uiExtentionAbility/PickerSession';
+import { WorkerRequestScope } from '../workers/base/WorkerWrapper';
 // import { HdsNavigation, HdsNavigationAttribute } from '@kit.UIDesignKit'
 
 const TAG = 'ContactUiExtentionIndex';
@@ -47,32 +49,43 @@ const TAG = 'ContactUiExtentionIndex';
 /**
  * Contact list Entry
  */
-let storage = LocalStorage.getShared()
-
-@Entry(storage)
+@Entry({ useSharedStorage: true })
 @Component
 export default struct ContactUiExtentionIndex {
 
   @Provide('pathInfos') pathInfos: NavPathStack = new NavPathStack();
   private isPC: boolean = EnvironmentProp.isPC();
-  private uiExtentionParam = ContactsGlobalThisHelper.GetGlobalThis()
-    .getValue<UiExtentionParam>(ContactsGlobalThisHelper.UiExtentionAbilityParams);
-  private mPresenter: ContactsPickerPresenter = ContactsPickerPresenter.getInstance();
-  @StorageLink('isShowBindSheet') isShowBindSheet: boolean = false;
+  @LocalStorageLink('parameters') private uiExtentionParam: UiExtentionParam = new UiExtentionParam();
+  @LocalStorageLink('pickerSession') private pickerSession: PickerSession | undefined = undefined;
+  private pageScope: WorkerRequestScope = new WorkerRequestScope();
+  @StorageProp('isGettingPickerData') private legacyGettingPickerData: boolean = false;
+  @StorageLink('isShowAccountants') private legacyShowAccountants: boolean = false;
+
+  private isLegacyFlow(): boolean {
+    return this.uiExtentionParam.isSaveContact || this.uiExtentionParam.isSaveExistContact ||
+      this.uiExtentionParam.urlType === URL_TYPE_CONTACT_LIST ||
+      this.uiExtentionParam.urlType === URL_TYPE_CONTACT_DETAIL;
+  }
+
+  private get currentBusy(): boolean {
+    return this.isLegacyFlow() ? this.legacyGettingPickerData : this.isGettingPickerData;
+  }
+  @LocalStorageLink('pickerPresenter') private mPresenter: ContactsPickerPresenter = ContactsPickerPresenter.getInstance();
+  @LocalStorageLink('isShowBindSheet') isShowBindSheet: boolean = false;
   @State isPageReady : boolean = false;
   @StorageLink('isShowPickerMaskLayer') isShowPickerMaskLayer: boolean = false;
   @StorageLink('breakpoint') curBp: string = 'sm';
   @StorageProp('isThemeActive') isThemeActive: boolean = false;
-  @StorageProp('isGettingPickerData') isGettingPickerData: boolean = false;
+  @LocalStorageProp('isGettingPickerData') isGettingPickerData: boolean = false;
   // 是否启动无障碍
   @StorageProp(AccessibilityUtil.ISOPENACCESSIBILITY) isOpenAccessibility: boolean = false;
   @StorageProp('fontSizeScale') fontSizeScale: number = 0;
-  @StorageProp('isFromSaveContactPicker') isFromSaveContactPicker: boolean = false;
-  @StorageProp('isSaveExistContact') isSaveExistContact: boolean = false;
+  @LocalStorageProp('isFromSaveContactPicker') isFromSaveContactPicker: boolean = false;
+  @LocalStorageProp('isSaveExistContact') isSaveExistContact: boolean = false;
   @StorageProp('isPickerSearch') isSearching: boolean = false;
-  @StorageLink('isShowAccountants') isShowAccountants: boolean = false;
+  @LocalStorageLink('isShowAccountants') isShowAccountants: boolean = false;
   @StorageProp('accountantTitleClass') accountantTitleClass: AccountantTitleClass = new AccountantTitleClass();
-  @StorageProp('contactFromPicker') contactFromPicker: contact.Contact = {
+  @LocalStorageProp('contactFromPicker') contactFromPicker: contact.Contact = {
     id: 0,
     key: '',
     emails: [],
@@ -115,6 +128,10 @@ export default struct ContactUiExtentionIndex {
   }
 
   aboutToAppear() {
+    this.pageScope.dispose();
+    this.pageScope = new WorkerRequestScope();
+    const scope = this.pageScope;
+    this.pickerSession?.addCleanup(() => scope.dispose());
     HiLog.w(TAG, `aboutToAppear! isPC: ${this.isPC}`);
     try {
       // 畅连拉起联系人列表页
@@ -181,11 +198,14 @@ export default struct ContactUiExtentionIndex {
   }
 
   onPageShow(): void {
+    const scope = this.pageScope;
     HiLog.i(TAG, 'onPageShow')
-    setTimeout(() => {
+    const timer = setTimeout(() => {
+      if (!scope.active || !this.pickerSession?.active) { return; }
       HiLog.i(TAG, 'show bind sheet')
       this.isShowBindSheet = true;
-    }, 100)
+    }, 100);
+    scope.onDispose(() => clearTimeout(timer));
   }
 
   onPageHide() {
@@ -193,6 +213,7 @@ export default struct ContactUiExtentionIndex {
   }
 
   aboutToDisappear() {
+    this.pageScope.dispose();
     HiLog.i(TAG, 'aboutToDisappear!');
     if (this.uiExtentionParam?.urlType === URL_TYPE_CONTACT_LIST ||
       this.uiExtentionParam?.urlType === URL_TYPE_CONTACT_DETAIL) {
@@ -217,7 +238,7 @@ export default struct ContactUiExtentionIndex {
   ShowContactsPickerPageView() {
     Stack() {
       ContactsPickerPage({ isContactMultiSelect: this.uiExtentionParam?.isContactMultiSelect })
-        .hitTestBehavior(this.isGettingPickerData ? HitTestMode.Block : HitTestMode.Default)
+        .hitTestBehavior(this.currentBusy ? HitTestMode.Block : HitTestMode.Default)
     }
     .width('100%').height('100%')
   }
@@ -235,7 +256,7 @@ export default struct ContactUiExtentionIndex {
         relationships: [],
         contactId: this.contactFromPicker.id as number,
       } })
-        .hitTestBehavior(this.isGettingPickerData ? HitTestMode.Block : HitTestMode.Default)
+        .hitTestBehavior(this.currentBusy ? HitTestMode.Block : HitTestMode.Default)
 
       // 新建联系人picker 应用锁
       if (this.isShowPickerMaskLayer) {
@@ -255,7 +276,11 @@ export default struct ContactUiExtentionIndex {
   @Builder
   ShowAccountantsView() {
     Column() {
-      Accountants({ isShowAccountants: $isShowAccountants })
+      if (this.isLegacyFlow()) {
+        Accountants({ isShowAccountants: $legacyShowAccountants })
+      } else {
+        Accountants({ isShowAccountants: $isShowAccountants })
+      }
     }.width('100%').height('100%')
   }
 
@@ -290,13 +315,12 @@ export default struct ContactUiExtentionIndex {
           backgroundColor: this.isThemeActive ? $r('app.color.skin_background_secondary') : undefined,
           preferType: this.curBp === 'sm' ? SheetType.BOTTOM : SheetType.CENTER,
           shouldDismiss: (sheetDismiss: SheetDismiss) => {
-            HiLog.w(TAG, `shouldDismiss, isGettingPickerData: ${this.isGettingPickerData
+            HiLog.w(TAG, `shouldDismiss, isGettingPickerData: ${this.currentBusy
             }, isSaveExistContact: ${this.isSaveExistContact}`);
-            if (!this.isGettingPickerData) {
+            if (this.pickerSession?.active && (!this.isLegacyFlow() || !this.currentBusy)) {
               this.isShowBindSheet = false;
               if (this.isSaveExistContact) {
-                ContactsGlobalThisHelper.GetGlobalThis()
-                  .getDefaultUIContext()?.terminateSelfWithResult({ resultCode: 1 })
+this.pickerSession?.finish({ resultCode: 1 })
                   .then(() => {
                     HiLog.i(TAG, 'terminateSelfWithResult Operation succeeded ');
                   })
@@ -305,10 +329,7 @@ export default struct ContactUiExtentionIndex {
                   });
               } else {
                 this.isShowBindSheet = false;
-                setTimeout(() => {
-                  // 选择联系人Picker，侧滑返回，返回默认选中的数据
-                  this.mPresenter.returnDefaultSelectContactData();
-                }, 100);
+                this.mPresenter.returnDefaultSelectContactData();
               }
             }
           },
@@ -340,10 +361,9 @@ export default struct ContactUiExtentionIndex {
           preferType: this.curBp === 'sm' ? SheetType.BOTTOM : SheetType.CENTER,
           shouldDismiss: (sheetDismiss: SheetDismiss) => {
             HiLog.i(TAG, 'save picker shouldDismiss')
-            if (!this.isGettingPickerData) {
+            if (this.pickerSession?.active && (!this.isLegacyFlow() || !this.currentBusy)) {
               HiLog.i(TAG, 'save picker shouldDismiss, is not get picker data')
-              ContactsGlobalThisHelper.GetGlobalThis()
-                .getDefaultUIContext()?.terminateSelfWithResult({ resultCode: 1 })
+this.pickerSession?.finish({ resultCode: 1 })
                 .then(() => {
                   HiLog.i(TAG, 'terminateSelfWithResult Operation succeeded ');
                 })
@@ -363,7 +383,7 @@ export default struct ContactUiExtentionIndex {
       Column() {
       }.backgroundColor('#0000000')
       .height(0).width(0).zIndex(0)
-      .bindSheet(this.isShowAccountants, this.ShowAccountantsView(), {
+      .bindSheet(this.isLegacyFlow() ? this.legacyShowAccountants : this.isShowAccountants, this.ShowAccountantsView(), {
         title: NavDestinationHeaderView({
           isThemeActive: this.accountantTitleClass.isThemeActive,
           isOpenAccessibility: this.accountantTitleClass.isOpenAccessibility,

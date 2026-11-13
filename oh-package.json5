@@ -8,7 +8,6 @@
   "dependencies": {
   },
   "devDependencies": {
-    "@ohos/hypium": "1.0.16",
 //    "@hms-paf/ui-widget-base": "14.16.9-314",
 //    "@hms-paf/ui-widget-about": "14.16.9-314"
   },
